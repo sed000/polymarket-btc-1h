@@ -1,0 +1,38 @@
+{
+  "name": "polymarket-btc-1h-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "db:real": "sqlite3 -header -column trades_real.db \"SELECT id, substr(market_slug, 1, 25) as market, side, printf('$%.2f', entry_price) as entry, printf('$%.2f', exit_price) as exit, printf('%.1f', shares) as shares, status, printf('$%.2f', pnl) as pnl, substr(created_at, 1, 16) as time FROM trades ORDER BY id DESC LIMIT 20; SELECT ''; SELECT 'TOTAL PnL: $' || printf('%.2f', SUM(pnl)) FROM trades;\"",
+    "db:paper": "sqlite3 -header -column trades_paper.db \"SELECT id, substr(market_slug, 1, 25) as market, side, printf('$%.2f', entry_price) as entry, printf('$%.2f', exit_price) as exit, printf('%.1f', shares) as shares, status, printf('$%.2f', pnl) as pnl, substr(created_at, 1, 16) as time FROM trades ORDER BY id DESC LIMIT 20; SELECT ''; SELECT 'TOTAL PnL: $' || printf('%.2f', SUM(pnl)) FROM trades;\"",
+    "db:stats:real": "sqlite3 trades_real.db \"SELECT COUNT(*) as total, SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses, printf('%.1f%%', 100.0 * SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) / COUNT(CASE WHEN pnl IS NOT NULL THEN 1 END)) as win_rate, printf('$%.2f', SUM(pnl)) as total_pnl FROM trades;\"",
+    "db:stats:paper": "sqlite3 trades_paper.db \"SELECT COUNT(*) as total, SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses, printf('%.1f%%', 100.0 * SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) / COUNT(CASE WHEN pnl IS NOT NULL THEN 1 END)) as win_rate, printf('$%.2f', SUM(pnl)) as total_pnl FROM trades;\"",
+    "db:reset:real": "rm -f trades_real.db && echo 'Real trading DB reset'",
+    "db:reset:paper": "rm -f trades_paper.db && echo 'Paper DB reset'",
+    "backtest": "bun run src/backtest/index.ts",
+    "backtest:run": "bun run src/backtest/index.ts run",
+    "backtest:fetch": "bun run src/backtest/index.ts fetch",
+    "backtest:optimize": "bun run src/backtest/index.ts optimize",
+    "backtest:genetic": "bun run src/backtest/index.ts genetic",
+    "backtest:compare": "bun run src/backtest/index.ts compare",
+    "backtest:history": "bun run src/backtest/index.ts history",
+    "backtest:stats": "bun run src/backtest/index.ts stats"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^4.0.0",
+    "ethers": "^5.7.2",
+    "ink": "^4.4.1",
+    "react": "^18.2.0",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^18.2.0",
+    "@types/ws": "^8.18.1",
+    "react-devtools-core": "^7.0.1"
+  }
+}

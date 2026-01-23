@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+trades.db
+bun.lockb
+*.db
+.DS_Store
