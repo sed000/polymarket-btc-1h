@@ -6,7 +6,7 @@ import { getPriceStream, UserStream, type MarketEvent, type PriceStream, type Us
 // Profit target for normal mode
 const PROFIT_TARGET = 0.99;
 
-export type RiskMode = "normal";
+export type RiskMode = "normal" | "optimized";
 
 export interface BotConfig {
   entryThreshold: number;  // e.g., 0.95

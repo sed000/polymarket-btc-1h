@@ -4,12 +4,23 @@ let db: Database | null = null;
 let currentDbPath: string | null = null;
 
 /**
+ * Database file mapping by mode
+ * - Paper + normal: trades_paper_normal.db
+ * - Paper + optimized: trades_paper_optimized.db
+ * - Real trading: trades_real.db
+ */
+const PAPER_DB_FILES: Record<string, string> = {
+  "normal": "trades_paper_normal.db",
+  "optimized": "trades_paper_optimized.db"
+};
+
+/**
  * Initialize the database based on trading mode
  * - Real trading: trades_real.db
- * - Paper trading: trades_paper.db
+ * - Paper trading: trades_paper_{mode}.db
  */
-export function initDatabase(paperTrading: boolean, riskMode: "normal"): void {
-  const dbPath = paperTrading ? "trades_paper.db" : "trades_real.db";
+export function initDatabase(paperTrading: boolean, riskMode: "normal" | "optimized"): void {
+  const dbPath = paperTrading ? (PAPER_DB_FILES[riskMode] || "trades_paper.db") : "trades_real.db";
 
   // Skip if already using this database
   if (currentDbPath === dbPath && db) {

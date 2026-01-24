@@ -18,8 +18,8 @@ export interface BacktestConfig {
   compoundLimit: number; // Take profit when balance exceeds this (0 = disabled)
   baseBalance: number; // Reset to this balance after taking profit
 
-  // Risk mode (only "normal" supported for 1-hour markets)
-  riskMode: "normal";
+  // Risk mode: "normal" or "optimized" (backtested optimal settings)
+  riskMode: "normal" | "optimized";
 }
 
 // Parameter ranges for optimization

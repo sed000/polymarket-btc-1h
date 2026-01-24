@@ -9,6 +9,7 @@ const parseEnvInt = (key: string, defaultVal: string): number =>
   parseInt(process.env[key] || defaultVal);
 
 const paperTrading = process.env.PAPER_TRADING === "true";
+const riskMode = (process.env.RISK_MODE || "normal") as "normal" | "optimized";
 
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 if (!PRIVATE_KEY && !paperTrading) {
@@ -20,16 +21,50 @@ if (!PRIVATE_KEY && !paperTrading) {
   process.exit(1);
 }
 
-const config: BotConfig = {
+// Optimized mode defaults (from backtesting optimization)
+// These values were found to maximize saved profits over 30-day backtest
+const OPTIMIZED_DEFAULTS = {
+  entryThreshold: 0.90,
+  maxEntryPrice: 0.95,
+  stopLoss: 0.72,
+  maxSpread: 0.05,
+  timeWindowMins: 20,
+  // Compound limits scale with starting balance (10x limit, 5x base)
+  compoundMultiplier: 10,
+  baseMultiplier: 5
+};
+
+const paperBalance = parseEnvFloat("PAPER_BALANCE", "100");
+
+// Build config based on risk mode
+const config: BotConfig = riskMode === "optimized" ? {
+  // Optimized mode: use backtested optimal values
+  entryThreshold: parseEnvFloat("ENTRY_THRESHOLD", String(OPTIMIZED_DEFAULTS.entryThreshold)),
+  maxEntryPrice: parseEnvFloat("MAX_ENTRY_PRICE", String(OPTIMIZED_DEFAULTS.maxEntryPrice)),
+  stopLoss: parseEnvFloat("STOP_LOSS", String(OPTIMIZED_DEFAULTS.stopLoss)),
+  maxSpread: parseEnvFloat("MAX_SPREAD", String(OPTIMIZED_DEFAULTS.maxSpread)),
+  timeWindowMs: parseEnvInt("TIME_WINDOW_MINS", String(OPTIMIZED_DEFAULTS.timeWindowMins)) * 60 * 1000,
+  pollIntervalMs: parseEnvInt("POLL_INTERVAL_MS", "10000"),
+  paperTrading,
+  paperBalance,
+  riskMode,
+  // Auto-scale compound limits based on starting balance (can be overridden via env)
+  compoundLimit: parseEnvFloat("COMPOUND_LIMIT", String(paperBalance * OPTIMIZED_DEFAULTS.compoundMultiplier)),
+  baseBalance: parseEnvFloat("BASE_BALANCE", String(paperBalance * OPTIMIZED_DEFAULTS.baseMultiplier)),
+  signatureType: parseEnvInt("SIGNATURE_TYPE", "1") as 0 | 1 | 2,
+  funderAddress: process.env.FUNDER_ADDRESS,
+  maxPositions: parseEnvInt("MAX_POSITIONS", "1")
+} : {
+  // Normal mode: use conservative defaults
   entryThreshold: parseEnvFloat("ENTRY_THRESHOLD", "0.95"),
   maxEntryPrice: parseEnvFloat("MAX_ENTRY_PRICE", "0.98"),
   stopLoss: parseEnvFloat("STOP_LOSS", "0.80"),
   maxSpread: parseEnvFloat("MAX_SPREAD", "0.03"),
-  timeWindowMs: parseEnvInt("TIME_WINDOW_MINS", "20") * 60 * 1000, // 20 minutes for 1-hour markets
+  timeWindowMs: parseEnvInt("TIME_WINDOW_MINS", "20") * 60 * 1000,
   pollIntervalMs: parseEnvInt("POLL_INTERVAL_MS", "10000"),
   paperTrading,
-  paperBalance: parseEnvFloat("PAPER_BALANCE", "100"),
-  riskMode: "normal" as const,
+  paperBalance,
+  riskMode,
   compoundLimit: parseEnvFloat("COMPOUND_LIMIT", "0"),
   baseBalance: parseEnvFloat("BASE_BALANCE", "10"),
   signatureType: parseEnvInt("SIGNATURE_TYPE", "1") as 0 | 1 | 2,
