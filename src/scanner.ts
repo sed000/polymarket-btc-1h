@@ -44,16 +44,30 @@ export interface EligibleMarket {
  * Example: bitcoin-up-or-down-january-24-5pm-et
  */
 function generateBtcHourlySlug(date: Date): string {
-  // Convert to Eastern Time
-  const etDate = new Date(date.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  // Convert to Eastern Time using Intl.DateTimeFormat for reliable timezone handling
+  // This approach preserves timezone context correctly
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    hour12: true
+  });
+
+  const parts = formatter.formatToParts(date);
+  const partMap: Record<string, string> = {};
+  for (const part of parts) {
+    partMap[part.type] = part.value;
+  }
 
   const months = ["january", "february", "march", "april", "may", "june",
                   "july", "august", "september", "october", "november", "december"];
-  const month = months[etDate.getMonth()];
-  const day = etDate.getDate();
-  let hour = etDate.getHours();
-  const ampm = hour >= 12 ? "pm" : "am";
-  hour = hour % 12 || 12;  // Convert to 12-hour format
+  const monthIndex = parseInt(partMap.month || "1", 10) - 1;
+  const month = months[monthIndex];
+  const day = parseInt(partMap.day || "1", 10);
+  const hour = parseInt(partMap.hour || "12", 10);
+  const ampm = (partMap.dayPeriod || "AM").toLowerCase();
 
   return `bitcoin-up-or-down-${month}-${day}-${hour}${ampm}-et`;
 }
@@ -163,10 +177,11 @@ export function analyzeMarket(
   const upTokenId = upIndex >= 0 ? market.clobTokenIds[upIndex] : "";
   const downTokenId = downIndex >= 0 ? market.clobTokenIds[downIndex] : "";
 
-  // Get bid/ask from WebSocket orderbook data
+  // Get bid/ask from WebSocket orderbook data, with Gamma API fallback
   let upBid = 0, upAsk = 0;
   let downBid = 0, downAsk = 0;
 
+  // First try WebSocket prices (real-time, most accurate)
   if (priceOverrides && upTokenId && priceOverrides[upTokenId]) {
     upBid = priceOverrides[upTokenId].bestBid;
     upAsk = priceOverrides[upTokenId].bestAsk;
@@ -174,6 +189,24 @@ export function analyzeMarket(
   if (priceOverrides && downTokenId && priceOverrides[downTokenId]) {
     downBid = priceOverrides[downTokenId].bestBid;
     downAsk = priceOverrides[downTokenId].bestAsk;
+  }
+
+  // SECURITY FIX: Fall back to Gamma API prices when WS prices unavailable
+  // This ensures entry scanning works even when WebSocket is down
+  if (upAsk === 0 && upIndex >= 0 && market.outcomePrices[upIndex]) {
+    const gammaPrice = parseFloat(market.outcomePrices[upIndex]);
+    if (gammaPrice > 0 && gammaPrice <= 1) {
+      // Gamma API returns mid-price, estimate bid/ask with small spread
+      upAsk = Math.min(gammaPrice + 0.005, 1);  // Add small spread
+      upBid = Math.max(gammaPrice - 0.005, 0);
+    }
+  }
+  if (downAsk === 0 && downIndex >= 0 && market.outcomePrices[downIndex]) {
+    const gammaPrice = parseFloat(market.outcomePrices[downIndex]);
+    if (gammaPrice > 0 && gammaPrice <= 1) {
+      downAsk = Math.min(gammaPrice + 0.005, 1);
+      downBid = Math.max(gammaPrice - 0.005, 0);
+    }
   }
 
   // Entry signal based on best ask (price you pay to buy)

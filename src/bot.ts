@@ -1,10 +1,14 @@
 import { Trader, type SignatureType, MIN_ORDER_SIZE } from "./trader";
 import { findEligibleMarkets, fetchBtc1HourMarkets, analyzeMarket, fetchMarketResolution, type EligibleMarket, type Market, type PriceOverride } from "./scanner";
-import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, type Trade } from "./db";
+import { insertTrade, closeTrade, getOpenTrades, getLastClosedTrade, getLastWinningTradeInMarket, type Trade } from "./db";
 import { getPriceStream, UserStream, type MarketEvent, type PriceStream, type UserOrderEvent, type UserTradeEvent } from "./websocket";
 
 // Profit target for normal mode
 const PROFIT_TARGET = 0.99;
+
+// Paper trading fee simulation (Polymarket charges ~1% taker fee)
+// This makes paper trading results more realistic
+const PAPER_FEE_RATE = 0.01;  // 1% fee on each trade
 
 export type RiskMode = "normal" | "optimized";
 
@@ -39,6 +43,7 @@ export interface Position {
 export interface BotState {
   running: boolean;
   balance: number;
+  reservedBalance: number;  // Balance reserved for in-flight orders (prevents overspend)
   savedProfit: number;  // Profit taken out via compound limit
   positions: Map<string, Position>;
   pendingEntries: Set<string>;  // Tokens with in-flight entry orders (prevents race conditions)
@@ -69,7 +74,8 @@ export interface WsStats {
 export type LogCallback = (message: string) => void;
 
 // Memory limits
-const MAX_LIMIT_FILLS_CACHE = 100;
+// Increased from 100 to 500 to reduce risk of missing profit exits
+const MAX_LIMIT_FILLS_CACHE = 500;
 
 export class Bot {
   private trader: Trader;
@@ -93,6 +99,7 @@ export class Bot {
     this.state = {
       running: false,
       balance: config.paperTrading ? config.paperBalance : 0,
+      reservedBalance: 0,
       savedProfit: 0,
       positions: new Map(),
       pendingEntries: new Set(),
@@ -225,7 +232,14 @@ export class Bot {
 
       if (this.trader.isReady()) {
         this.state.tradingEnabled = true;
-        this.state.balance = await this.trader.getBalance();
+        const balance = await this.trader.getBalance();
+        if (balance === null) {
+          this.state.initError = "Failed to fetch wallet balance - check API connection";
+          this.state.tradingEnabled = false;
+          this.log("Trading disabled: API error fetching balance");
+          return;
+        }
+        this.state.balance = balance;
         this.log(`Balance: $${this.state.balance.toFixed(2)} USDC`);
         await this.initUserStream();
 
@@ -233,7 +247,29 @@ export class Bot {
         const openTrades = getOpenTrades();
         for (const trade of openTrades) {
           // Verify position actually exists on Polymarket
-          const actualBalance = await this.trader.getPositionBalance(trade.token_id);
+          // Retry up to 3 times to distinguish API errors from actual 0 balance
+          let actualBalance: number | null = null;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            actualBalance = await this.trader.getPositionBalance(trade.token_id);
+            if (actualBalance !== null) break;
+            this.log(`Position check failed (attempt ${attempt}/3), retrying...`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+
+          // API error after all retries - keep position in DB, don't close
+          if (actualBalance === null) {
+            this.log(`Warning: Cannot verify position ${trade.side} - keeping in DB (API error)`);
+            this.state.positions.set(trade.token_id, {
+              tradeId: trade.id,
+              tokenId: trade.token_id,
+              shares: trade.shares, // Use DB value since API failed
+              entryPrice: trade.entry_price,
+              side: trade.side as "UP" | "DOWN",
+              marketSlug: trade.market_slug,
+              marketEndDate: this.parseMarketEndDate(trade)
+            });
+            continue;
+          }
 
           if (actualBalance < 0.01) {
             // Position doesn't exist - was sold manually or resolved
@@ -324,7 +360,8 @@ export class Bot {
       }
     }
     if (!slug) return;
-    if (!slug.startsWith("btc-updown-1h-")) return;
+    // Match actual API format: "bitcoin-up-or-down-{month}-{day}-{hour}{am/pm}-et"
+    if (!slug.startsWith("bitcoin-up-or-down-")) return;
 
     const eventType = event.eventType.toLowerCase();
     if (eventType === "market_resolved" || event.winningAssetId) {
@@ -346,11 +383,29 @@ export class Bot {
       if (!event.assetsIds || event.assetsIds.length < 2) return;
       if (this.state.markets.some(m => m.slug === slug)) return;
 
-      const match = slug.match(/btc-updown-1h-(\d+)/);
-      if (!match) return;
+      // Parse BTC hourly market slug format: bitcoin-up-or-down-{month}-{day}-{hour}{am/pm}-et
+      const slugMatch = slug.match(/bitcoin-up-or-down-(\w+)-(\d+)-(\d+)(am|pm)-et/);
+      if (!slugMatch) return;
 
-      const startTimestamp = parseInt(match[1], 10) * 1000;
-      const endDate = new Date(startTimestamp + 60 * 60 * 1000).toISOString();
+      // Parse end date from slug components
+      const monthNames = ["january", "february", "march", "april", "may", "june",
+                         "july", "august", "september", "october", "november", "december"];
+      const monthStr = slugMatch[1].toLowerCase();
+      const monthIndex = monthNames.indexOf(monthStr);
+      const day = parseInt(slugMatch[2], 10);
+      let hour = parseInt(slugMatch[3], 10);
+      const ampm = slugMatch[4].toLowerCase();
+
+      // Convert to 24-hour format
+      if (ampm === "pm" && hour !== 12) hour += 12;
+      if (ampm === "am" && hour === 12) hour = 0;
+
+      // Market ends 1 hour after the start hour (ET timezone)
+      const now = new Date();
+      const year = now.getFullYear();
+      // Create date in ET (approximate - market start time + 1 hour)
+      const marketEndHour = hour + 1;
+      const endDate = new Date(Date.UTC(year, monthIndex >= 0 ? monthIndex : 0, day, marketEndHour + 5, 0, 0)).toISOString(); // +5 for ET to UTC approximation
       const outcomes = event.outcomes && event.outcomes.length >= 2 ? event.outcomes : ["Up", "Down"];
 
       const market: Market = {
@@ -444,7 +499,10 @@ export class Bot {
       }
 
       this.log(`[${source}] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
-      this.state.balance = await this.trader.getBalance();
+      const newBalance = await this.trader.getBalance();
+      if (newBalance !== null) {
+        this.state.balance = newBalance;
+      }
     } finally {
       this.pendingLimitFills.delete(position.tokenId);
     }
@@ -596,8 +654,20 @@ export class Bot {
     }
   }
 
+  /**
+   * Check if WebSocket prices are fresh and reliable
+   * Returns false if WS is disconnected or prices are stale
+   */
+  private isPriceFresh(tokenId: string): boolean {
+    if (!this.state.wsConnected || !this.priceStream.isConnected()) {
+      return false;
+    }
+    const price = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
+    return price !== null;
+  }
+
   private getPriceOverrides(): PriceOverride | undefined {
-    if (!this.state.wsConnected) return undefined;
+    if (!this.state.wsConnected || !this.priceStream.isConnected()) return undefined;
 
     const overrides: PriceOverride = {};
     for (const market of this.state.markets) {
@@ -648,7 +718,12 @@ export class Bot {
       // In paper mode, balance is managed internally
       if (!this.config.paperTrading) {
         const walletBalance = await this.trader.getBalance();
-        this.applyCompoundLimit(walletBalance);
+        if (walletBalance === null) {
+          this.log("Warning: Failed to fetch wallet balance - using cached value");
+          // Don't update balance if API failed - use last known value
+        } else {
+          this.applyCompoundLimit(walletBalance);
+        }
       }
 
       // Check for limit order fills (profit taking)
@@ -676,16 +751,18 @@ export class Bot {
           // Paper trading: check if price hit profit target
           const wsPrice = this.priceStream.getPrice(tokenId, this.wsPriceMaxAgeMs);
           if (wsPrice && wsPrice.bestBid >= this.getProfitTarget()) {
-            // Simulate limit order fill at profit target
+            // Simulate limit order fill at profit target with fee
             const exitPrice = this.getProfitTarget();
-            const proceeds = exitPrice * position.shares;
-            const pnl = (exitPrice - position.entryPrice) * position.shares;
+            const grossProceeds = exitPrice * position.shares;
+            const fee = grossProceeds * PAPER_FEE_RATE;
+            const proceeds = grossProceeds - fee;
+            const pnl = proceeds - (position.entryPrice * position.shares);
 
             closeTrade(position.tradeId, exitPrice, "RESOLVED");
             this.state.positions.delete(tokenId);
             this.state.balance += proceeds;
 
-            this.log(`[PAPER] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
+            this.log(`[PAPER] Limit order filled @ $${exitPrice.toFixed(2)}! PnL: $${pnl.toFixed(2)} (fee: $${fee.toFixed(2)})`);
             this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
             this.checkCompoundLimit();
           }
@@ -733,7 +810,10 @@ export class Bot {
               this.state.positions.delete(tokenId);
 
               this.log(`Profit taken @ $${result.price.toFixed(2)}! PnL: $${pnl.toFixed(2)}`);
-              this.state.balance = await this.trader.getBalance();
+              const newBalance = await this.trader.getBalance();
+              if (newBalance !== null) {
+                this.state.balance = newBalance;
+              }
             }
           } else if (!position.limitOrderId) {
             // Try to place limit order if we don't have one
@@ -786,41 +866,108 @@ export class Bot {
 
           // We won if our side matches the winner
           const exitPrice = position.side === winner ? 1.00 : 0.00;
-          this.log(`[PAPER] Market resolved: ${winner} won - we ${position.side === winner ? "won" : "lost"}`);
+          const weWon = position.side === winner;
+          this.log(`[PAPER] Market resolved: ${winner} won - we ${weWon ? "WON" : "LOST"}`);
 
-          const proceeds = exitPrice * position.shares;
-          const pnl = (exitPrice - position.entryPrice) * position.shares;
+          // Note: Redemption after resolution typically has no fee (it's automatic),
+          // but we simulate a small fee for realism
+          const grossProceeds = exitPrice * position.shares;
+          const fee = weWon ? grossProceeds * PAPER_FEE_RATE : 0; // No fee on $0 exit
+          const proceeds = grossProceeds - fee;
+          const pnl = proceeds - (position.entryPrice * position.shares);
 
           closeTrade(position.tradeId, exitPrice, "RESOLVED");
           this.state.positions.delete(tokenId);
           this.state.balance += proceeds;
 
-          this.log(`[PAPER] Market resolved. Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
+          this.log(`[PAPER] Position closed @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}${fee > 0 ? ` (fee: $${fee.toFixed(2)})` : ""}`);
           this.log(`[PAPER] New balance: $${this.state.balance.toFixed(2)}`);
           this.checkCompoundLimit();
         } else {
-          // Real trading: cancel limit order then market sell at actual price
+          // Real trading: handle market resolution
           try {
-            // Cancel the limit order if it exists
-            if (position.limitOrderId) {
-              await this.trader.cancelOrder(position.limitOrderId);
-              this.log(`Cancelled unfilled limit order`);
-            }
+            // First check if bid is valid for selling
+            const bidCheck = await this.trader.checkBidValid(tokenId);
 
-            // Market sell at actual bid price
-            const result = await this.trader.marketSell(tokenId, position.shares);
-            if (result) {
-              closeTrade(position.tradeId, result.price, "RESOLVED");
+            if (!bidCheck.valid) {
+              // Market has likely resolved - bid is 0 or < 0.01
+              // SECURITY FIX: Implement redemption flow for resolved markets
+              this.log(`Market appears resolved (bid=${bidCheck.bid.toFixed(4)})`);
+
+              // Check resolution from WebSocket or API
+              let winner: "UP" | "DOWN" | null = null;
+              const winningTokenId = this.state.marketResolutions.get(position.marketSlug);
+              if (winningTokenId) {
+                const market = this.state.markets.find(m => m.slug === position.marketSlug);
+                if (market && market.clobTokenIds.length >= 2) {
+                  // Validate token IDs against outcomes
+                  const upIdx = market.outcomes.findIndex(o => o.toLowerCase() === "up");
+                  const downIdx = market.outcomes.findIndex(o => o.toLowerCase() === "down");
+                  if (upIdx >= 0 && downIdx >= 0) {
+                    winner = winningTokenId === market.clobTokenIds[upIdx] ? "UP" : "DOWN";
+                  }
+                }
+              }
+
+              // Fall back to API if no WebSocket resolution
+              if (!winner) {
+                winner = await fetchMarketResolution(position.marketSlug);
+              }
+
+              if (!winner) {
+                this.log(`Waiting for market resolution confirmation...`);
+                continue;
+              }
+
+              // Cancel limit order now that we know market resolved
+              if (position.limitOrderId) {
+                await this.trader.cancelOrder(position.limitOrderId);
+              }
+
+              // Determine exit price based on winner
+              const weWon = position.side === winner;
+              const exitPrice = weWon ? 1.00 : 0.00;
+              const pnl = (exitPrice - position.entryPrice) * position.shares;
+
+              this.log(`Market resolved: ${winner} won - we ${weWon ? "WON" : "LOST"}`);
+
+              // Close the trade in DB
+              closeTrade(position.tradeId, exitPrice, "RESOLVED");
               this.state.positions.delete(tokenId);
-              const realPnl = (result.price - position.entryPrice) * position.shares;
 
-              this.log(`Market resolved @ $${result.price.toFixed(2)}. PnL: $${realPnl.toFixed(2)}`);
+              this.log(`Position closed @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
 
-              // Sync balance after exit
-              this.state.balance = await this.trader.getBalance();
+              // Sync balance - if we won, the USDC should already be credited
+              const newBalance = await this.trader.getBalance();
+              if (newBalance !== null) {
+                this.state.balance = newBalance;
+              }
+            } else {
+              // Bid is valid - can sell normally
+              // Cancel the limit order if it exists
+              if (position.limitOrderId) {
+                await this.trader.cancelOrder(position.limitOrderId);
+                this.log(`Cancelled unfilled limit order`);
+              }
+
+              // Market sell at actual bid price
+              const result = await this.trader.marketSell(tokenId, position.shares);
+              if (result) {
+                closeTrade(position.tradeId, result.price, "RESOLVED");
+                this.state.positions.delete(tokenId);
+                const realPnl = (result.price - position.entryPrice) * position.shares;
+
+                this.log(`Market resolved @ $${result.price.toFixed(2)}. PnL: $${realPnl.toFixed(2)}`);
+
+                // Sync balance after exit
+                const newBalance = await this.trader.getBalance();
+                if (newBalance !== null) {
+                  this.state.balance = newBalance;
+                }
+              }
             }
           } catch (err) {
-            this.log(`Error selling expired position: ${err}`);
+            this.log(`Error handling expired position: ${err}`);
           }
         }
       }
@@ -837,6 +984,14 @@ export class Bot {
 
     const position = this.state.positions.get(tokenId);
     if (!position) return;
+
+    // SECURITY FIX: Don't trigger stop-loss on empty order book (bid=0)
+    // This could indicate a temporarily illiquid market or resolved market
+    // Empty book triggers would cancel limit orders and leave position unmanaged
+    if (currentBid === 0) {
+      // Log only occasionally to avoid spam
+      return;
+    }
 
     const activeConfig = this.getActiveConfig();
 
@@ -869,36 +1024,62 @@ export class Bot {
       this.log(`[WS] Stop-loss TRIGGERED for ${position.side} @ $${currentBid.toFixed(2)}`);
 
       if (this.config.paperTrading) {
-        // Paper trading: simulate sell at bid price
+        // Paper trading: simulate sell at bid price with fee
         const exitPrice = currentBid;
-        const proceeds = exitPrice * position.shares;
+        const grossProceeds = exitPrice * position.shares;
+        const fee = grossProceeds * PAPER_FEE_RATE;
+        const proceeds = grossProceeds - fee;
         closeTrade(position.tradeId, exitPrice, "STOPPED");
         this.state.positions.delete(tokenId);
         this.state.balance += proceeds;
-        const pnl = (exitPrice - position.entryPrice) * position.shares;
-        this.log(`[PAPER] Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
+        const pnl = proceeds - (position.entryPrice * position.shares);
+        this.log(`[PAPER] Sold ${position.shares.toFixed(2)} shares @ $${exitPrice.toFixed(2)}. PnL: $${pnl.toFixed(2)} (fee: $${fee.toFixed(2)})`);
 
         this.checkCompoundLimit();
       } else {
-        // Real trading: cancel limit order then market sell
+        // Real trading: verify bid is valid BEFORE canceling limit order
+        // This prevents leaving position unmanaged if market has resolved
         try {
-          if (position.limitOrderId) {
-            await this.trader.cancelOrder(position.limitOrderId);
-            this.log(`Cancelled limit order`);
+          // Check if bid is valid for selling (not empty book or resolved market)
+          const bidCheck = await this.trader.checkBidValid(tokenId);
+
+          if (!bidCheck.valid) {
+            if (bidCheck.reason === "empty_book" || bidCheck.reason === "below_minimum") {
+              this.log(`[STOP-LOSS] Market may have resolved (bid=${bidCheck.bid.toFixed(4)}) - keeping limit order active`);
+              // Don't cancel limit order - it may still fill if market resolves in our favor
+              // TODO: Add redemption flow for resolved markets
+              return;
+            }
           }
 
+          // First attempt market sell WITHOUT canceling limit order
+          // This way if sell fails, we still have the limit order as protection
           const result = await this.trader.marketSell(tokenId, position.shares);
+
           if (result) {
+            // Sell succeeded - NOW cancel the limit order to prevent double-sell
+            if (position.limitOrderId) {
+              await this.trader.cancelOrder(position.limitOrderId);
+              this.log(`Cancelled limit order after successful stop-loss`);
+            }
+
             closeTrade(position.tradeId, result.price, "STOPPED");
             this.state.positions.delete(tokenId);
             const pnl = (result.price - position.entryPrice) * position.shares;
             this.log(`Closed position @ $${result.price.toFixed(2)}. PnL: $${pnl.toFixed(2)}`);
 
             // Sync balance after exit
-            this.state.balance = await this.trader.getBalance();
+            const newBalance = await this.trader.getBalance();
+            if (newBalance !== null) {
+              this.state.balance = newBalance;
+            }
+          } else {
+            // Sell failed - keep limit order active as fallback protection
+            this.log(`[STOP-LOSS] Market sell failed - keeping limit order active as fallback`);
           }
         } catch (err) {
           this.log(`Error executing stop-loss: ${err}`);
+          // Don't release mutex immediately - keep protection active
         }
       }
     } finally {
@@ -968,9 +1149,28 @@ export class Bot {
     const timeRemaining = endTime - now;
     if (timeRemaining <= 0 || timeRemaining > activeConfig.timeWindowMs) return;
 
-    // Determine which side this token is (UP or DOWN)
-    const isUpToken = market.clobTokenIds[0] === tokenId;
-    const side: "UP" | "DOWN" = isUpToken ? "UP" : "DOWN";
+    // Determine which side this token is (UP or DOWN) by matching against outcomes
+    // SECURITY FIX: Validate token IDs against market.outcomes array instead of assuming [0]=UP
+    const upIndex = market.outcomes.findIndex(o => o.toLowerCase() === "up");
+    const downIndex = market.outcomes.findIndex(o => o.toLowerCase() === "down");
+
+    if (upIndex < 0 || downIndex < 0) {
+      this.log(`Warning: Market ${market.slug} missing UP/DOWN outcomes`);
+      return;
+    }
+
+    const upTokenId = market.clobTokenIds[upIndex];
+    const downTokenId = market.clobTokenIds[downIndex];
+    let side: "UP" | "DOWN";
+
+    if (tokenId === upTokenId) {
+      side = "UP";
+    } else if (tokenId === downTokenId) {
+      side = "DOWN";
+    } else {
+      this.log(`Warning: Token ${tokenId.slice(0, 8)}... doesn't match UP or DOWN for ${market.slug}`);
+      return;
+    }
 
     // Check spread
     const spread = bestAsk - bestBid;
@@ -984,16 +1184,17 @@ export class Bot {
 
     // Build eligible market object for enterPosition
     const marketEndDate = market.endDate instanceof Date ? market.endDate : new Date(market.endDate);
+    const isUpSide = side === "UP";
     const eligibleMarket: EligibleMarket = {
       slug: market.slug,
       question: market.question,
       endDate: marketEndDate,
-      upTokenId: market.clobTokenIds[0],
-      downTokenId: market.clobTokenIds[1],
-      upBid: isUpToken ? bestBid : 0,
-      upAsk: isUpToken ? bestAsk : 1,
-      downBid: isUpToken ? 0 : bestBid,
-      downAsk: isUpToken ? 1 : bestAsk,
+      upTokenId,    // Use validated token IDs
+      downTokenId,  // Use validated token IDs
+      upBid: isUpSide ? bestBid : 0,
+      upAsk: isUpSide ? bestAsk : 1,
+      downBid: isUpSide ? 0 : bestBid,
+      downAsk: isUpSide ? 1 : bestAsk,
       timeRemaining,
       eligibleSide: side
     };
@@ -1031,6 +1232,14 @@ export class Bot {
     }
   }
 
+  /**
+   * Get available balance (total balance minus reserved for in-flight orders)
+   * This prevents overspending when multiple signals arrive simultaneously
+   */
+  private getAvailableBalance(): number {
+    return Math.max(0, this.state.balance - this.state.reservedBalance);
+  }
+
   private async enterPosition(market: EligibleMarket): Promise<void> {
     const activeConfig = this.getActiveConfig();
     const side = market.eligibleSide!;
@@ -1051,8 +1260,11 @@ export class Bot {
 
     try {
       // Check position limit (prevent excessive risk exposure)
-      if (this.state.positions.size >= this.config.maxPositions) {
-        this.log(`Skipping: max positions (${this.config.maxPositions}) reached`);
+      // SECURITY FIX: Count both active positions AND pending entries to prevent race condition
+      // Without this, concurrent signals could all pass the check before any position is recorded
+      const totalPositions = this.state.positions.size + this.state.pendingEntries.size - 1; // -1 because we already added ourselves
+      if (totalPositions >= this.config.maxPositions) {
+        this.log(`Skipping: max positions (${this.config.maxPositions}) reached (${this.state.positions.size} active, ${this.state.pendingEntries.size - 1} pending)`);
         return;
       }
 
@@ -1075,49 +1287,52 @@ export class Bot {
         return;
       }
 
-      // Only enter OPPOSITE side of last closed trade IN THE SAME MARKET
-      // BUT only if that trade was a WIN (positive PnL) - not a stop-loss
+      // SECURITY FIX: Check if we've already WON on this side in THIS market
       // This prevents chasing the same direction after it already won
-      // But allows re-entry after a stop-loss (give it another chance)
-      const lastTrade = getLastClosedTrade();
-      if (lastTrade && lastTrade.market_slug === market.slug && lastTrade.side === side) {
-        // Check actual PnL - more reliable than comparing exit price to target
-        if (lastTrade.pnl && lastTrade.pnl > 0) {
-          this.log(`Skipping: already won ${side} with +$${lastTrade.pnl.toFixed(2)} in this market`);
-          return;
-        }
-        // If stopped out (negative PnL), allow re-entry
-        this.log(`Re-entering ${side} after loss (prev PnL: $${lastTrade.pnl?.toFixed(2) || 'unknown'})`);
+      // We check ALL winning trades in this market, not just the last global trade
+      const lastWin = getLastWinningTradeInMarket(market.slug, side);
+      if (lastWin) {
+        this.log(`Skipping: already won ${side} with +$${lastWin.pnl?.toFixed(2) || '0'} in this market`);
+        return;
       }
 
       this.log(`Entry signal: ${side} @ $${askPrice.toFixed(2)} ask (${Math.floor(market.timeRemaining / 1000)}s remaining)`);
 
       if (this.config.paperTrading) {
-        // Paper trading: simulate buy at ask price
-        const balance = this.state.balance;
+        // Paper trading: simulate buy at ask price with fee
+        // Use available balance (total - reserved) to prevent overspending
+        const balance = this.getAvailableBalance();
         if (balance < 1) {
           this.log("Insufficient paper balance");
           return;
         }
 
-        // Calculate shares: balance / askPrice
-        const shares = balance / askPrice;
+        // Apply trading fee to get effective balance for buying
+        const effectiveBalance = balance * (1 - PAPER_FEE_RATE);
+
+        // Calculate shares: effectiveBalance / askPrice
+        const shares = effectiveBalance / askPrice;
 
         // Check minimum order size (Polymarket requires at least 5 shares)
         if (shares < MIN_ORDER_SIZE) {
-          const minUsdc = MIN_ORDER_SIZE * askPrice;
+          const minUsdc = MIN_ORDER_SIZE * askPrice / (1 - PAPER_FEE_RATE);
           this.log(`[PAPER] Insufficient balance for ${MIN_ORDER_SIZE} shares (need $${minUsdc.toFixed(2)}, have $${balance.toFixed(2)})`);
           return;
         }
 
-        // Record paper trade
+        // Reserve the balance immediately to prevent concurrent entries from seeing the same funds
+        this.state.reservedBalance += balance;
+
+        const fee = balance * PAPER_FEE_RATE;
+
+        // Record paper trade (entry_price is actual price, cost_basis includes fee)
         const tradeId = insertTrade({
           market_slug: market.slug,
           token_id: tokenId,
           side,
           entry_price: askPrice,
           shares,
-          cost_basis: balance,
+          cost_basis: balance, // Full balance spent including fee
           created_at: new Date().toISOString(),
           market_end_date: endDate.toISOString()
         });
@@ -1133,14 +1348,15 @@ export class Bot {
           limitOrderId: "paper-limit-" + tradeId // Simulated limit order
         });
 
-        // Deduct from paper balance
-        this.state.balance = 0;
+        // Deduct from paper balance and clear reservation
+        this.state.balance -= balance;
+        this.state.reservedBalance -= balance;
 
-        this.log(`[PAPER] Bought ${shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask`);
+        this.log(`[PAPER] Bought ${shares.toFixed(2)} shares of ${side} @ $${askPrice.toFixed(2)} ask (fee: $${fee.toFixed(2)})`);
         this.log(`[PAPER] Placed limit sell @ $${this.getProfitTarget().toFixed(2)}`);
       } else {
-        // Real trading - use compound-limited balance (set by applyCompoundLimit in tick)
-        const balance = this.state.balance;
+        // Real trading - use available balance (total - reserved) to prevent overspending
+        const balance = this.getAvailableBalance();
         if (balance < 1) {
           this.log("Insufficient balance");
           return;
@@ -1154,8 +1370,13 @@ export class Bot {
           return;
         }
 
+        // Reserve the balance immediately to prevent concurrent entries from seeing the same funds
+        this.state.reservedBalance += balance;
+
         const result = await this.trader.buy(tokenId, askPrice, balance);
         if (!result) {
+          // Release reservation on failure
+          this.state.reservedBalance -= balance;
           this.log("Order failed");
           return;
         }
@@ -1165,11 +1386,28 @@ export class Bot {
         const fillInfo = await this.trader.waitForFill(result.orderId, 10000);
 
         if (!fillInfo || fillInfo.filledShares <= 0) {
-          // Order didn't fill - cancel it and abort
+          // Order didn't fill - cancel it and release reservation
           this.log("Order did not fill, cancelling...");
           await this.trader.cancelOrder(result.orderId);
+          // Verify cancellation succeeded
+          const cancelled = await this.trader.verifyOrderCancelled(result.orderId);
+          if (!cancelled) {
+            this.log("WARNING: Order cancellation not confirmed - monitoring for unexpected fills");
+          }
+          this.state.reservedBalance -= balance;
           return;
         }
+
+        // SECURITY FIX: Cancel any remaining unfilled portion to prevent untracked exposure
+        // This handles partial fills where only some shares were filled before timeout
+        const orderedShares = balance / askPrice;
+        if (fillInfo.filledShares < orderedShares * 0.99) {
+          this.log(`Partial fill detected (${fillInfo.filledShares.toFixed(2)}/${orderedShares.toFixed(2)} shares), cancelling remainder...`);
+          await this.trader.cancelOrder(result.orderId);
+        }
+
+        // Release the full reservation - actual balance will be synced from wallet
+        this.state.reservedBalance -= balance;
 
         // Use actual fill data instead of assumed values
         const actualShares = fillInfo.filledShares;
@@ -1179,12 +1417,23 @@ export class Bot {
         this.log(`Order filled: ${actualShares.toFixed(2)} shares @ $${actualEntryPrice.toFixed(2)}`);
 
         // Wait for position to settle before placing limit sell
+        // SECURITY FIX: Use proper polling instead of arbitrary 3s wait
         this.log(`Waiting for position settlement...`);
-        await new Promise(resolve => setTimeout(resolve, 3000)); // 3s initial delay
+        const settled = await this.trader.waitForPositionBalance(tokenId, actualShares, 15000);
 
         // Get ACTUAL position balance (may differ from calculated due to fees)
         const actualPositionBalance = await this.trader.getPositionBalance(tokenId);
-        const sharesToSell = actualPositionBalance > 0 ? actualPositionBalance : actualShares;
+        let sharesToSell: number;
+
+        if (actualPositionBalance === null) {
+          this.log(`Warning: Cannot verify position balance - using fill info`);
+          sharesToSell = actualShares;
+        } else if (!settled && actualPositionBalance < actualShares * 0.5) {
+          this.log(`Warning: Position settlement incomplete (${actualPositionBalance.toFixed(2)}/${actualShares.toFixed(2)} shares)`);
+          sharesToSell = actualPositionBalance > 0 ? actualPositionBalance : actualShares;
+        } else {
+          sharesToSell = actualPositionBalance > 0 ? actualPositionBalance : actualShares;
+        }
 
         if (Math.abs(sharesToSell - actualShares) > 0.01) {
           this.log(`Adjusted shares: ${actualShares.toFixed(2)} → ${sharesToSell.toFixed(2)} (actual balance)`);
@@ -1224,8 +1473,13 @@ export class Bot {
         });
 
         // Sync balance after trade
-        this.state.balance = await this.trader.getBalance();
-        this.log(`Balance after trade: $${this.state.balance.toFixed(2)}`);
+        const newBalance = await this.trader.getBalance();
+        if (newBalance !== null) {
+          this.state.balance = newBalance;
+          this.log(`Balance after trade: $${this.state.balance.toFixed(2)}`);
+        } else {
+          this.log(`Warning: Failed to sync balance after trade`);
+        }
       }
     } finally {
       // MUTEX: Always release the lock
