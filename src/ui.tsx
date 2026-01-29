@@ -9,8 +9,7 @@ interface AppProps {
 }
 
 function Header({ state, config }: { state: BotState; config: BotConfig }) {
-  const isOptimized = config.riskMode === "optimized";
-  const borderColor = isOptimized ? "green" : state.paperTrading ? "yellow" : "cyan";
+  const borderColor = state.paperTrading ? "yellow" : "cyan";
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor={borderColor} paddingX={1}>
@@ -19,9 +18,6 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
           POLYMARKET BTC 1-HOUR BOT {state.paperTrading && "[PAPER]"}
         </Text>
         <Box gap={2}>
-          {isOptimized && (
-            <Text color="green" bold>OPTIMIZED</Text>
-          )}
           <Text color={state.wsConnected ? "green" : "yellow"}>
             {state.wsConnected ? "WS" : "REST"}
           </Text>
@@ -51,7 +47,7 @@ function Header({ state, config }: { state: BotState; config: BotConfig }) {
         {state.savedProfit > 0 && (
           <Text>Saved: <Text color="cyan">${state.savedProfit.toFixed(2)}</Text></Text>
         )}
-        <Text>Entry: <Text color={isOptimized ? "green" : "yellow"}>${config.entryThreshold.toFixed(2)}-{config.maxEntryPrice.toFixed(2)}</Text></Text>
+        <Text>Entry: <Text color="yellow">${config.entryThreshold.toFixed(2)}-{config.maxEntryPrice.toFixed(2)}</Text></Text>
         <Text>Stop: <Text color="red">≤${config.stopLoss.toFixed(2)}</Text></Text>
         <Text>Pos: <Text color="cyan">{state.positions.size}</Text></Text>
       </Box>

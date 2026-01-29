@@ -1,3 +1,5 @@
+import type { RiskMode } from "../config";
+
 // Configuration for a single backtest run
 export interface BacktestConfig {
   // Strategy parameters
@@ -18,8 +20,8 @@ export interface BacktestConfig {
   compoundLimit: number; // Take profit when balance exceeds this (0 = disabled)
   baseBalance: number; // Reset to this balance after taking profit
 
-  // Risk mode: "normal" or "optimized" (backtested optimal settings)
-  riskMode: "normal" | "optimized";
+  // Risk mode: only "normal" is supported
+  riskMode: RiskMode;
 }
 
 // Parameter ranges for optimization
