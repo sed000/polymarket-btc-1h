@@ -39,6 +39,7 @@ export class Trader {
   private signer: Wallet;
   private initialized = false;
   private initError: string | null = null;
+  private lastMarketSellError: string | null = null;
   private apiCreds: ApiCreds | null = null;
   private signatureType: SignatureType;
   private funderAddress: string | undefined;
@@ -116,6 +117,10 @@ export class Trader {
 
   getApiCreds(): ApiCreds | null {
     return this.apiCreds;
+  }
+
+  getLastMarketSellError(): string | null {
+    return this.lastMarketSellError;
   }
 
   private ensureClient(): ClobClient {
@@ -385,8 +390,14 @@ export class Trader {
     return { valid: true, bid };
   }
 
-  async marketSell(tokenId: string, shares: number, maxRetries: number = 3): Promise<{ orderId: string; price: number } | null> {
+  async marketSell(
+    tokenId: string,
+    shares: number,
+    bidOverride?: number,
+    maxRetries: number = 3
+  ): Promise<{ orderId: string; price: number } | null> {
     const client = this.ensureClient();
+    this.lastMarketSellError = null;
 
     // Validate input shares
     if (!shares || shares < 0.01) {
@@ -409,22 +420,35 @@ export class Trader {
           throw new Error(`[STOP-LOSS] validateAndAdjustShares returned null - check position balance`);
         }
 
-        // Get current bid price for market sell (already rate limited)
-        const bidCheck = await this.checkBidValid(tokenId);
-
-        if (!bidCheck.valid) {
-          let errMsg: string;
-          if (bidCheck.reason === "empty_book") {
-            errMsg = `[STOP-LOSS] Order book empty (bid=0) - market may have resolved or no liquidity`;
-          } else {
-            errMsg = `[STOP-LOSS] Bid price too low: $${bidCheck.bid.toFixed(4)} (min: 0.05) - likely bad data or resolved market`;
+        // Use WebSocket bid override if provided and valid; otherwise fall back to REST
+        let validBid: number;
+        if (Number.isFinite(bidOverride ?? NaN) && (bidOverride as number) > 0) {
+          validBid = bidOverride as number;
+          if (validBid < 0.05) {
+            const errMsg = `[STOP-LOSS] Bid override too low: $${validBid.toFixed(4)} (min: 0.05)`;
+            this.lastMarketSellError = errMsg;
+            console.error(errMsg);
+            throw new Error(errMsg);
           }
-          console.error(errMsg);
-          // Don't retry if market is likely resolved - throw to trigger redemption flow
-          throw new Error(errMsg);
-        }
+        } else {
+          // Get current bid price for market sell (already rate limited)
+          const bidCheck = await this.checkBidValid(tokenId);
 
-        let validBid = bidCheck.bid;
+          if (!bidCheck.valid) {
+            let errMsg: string;
+            if (bidCheck.reason === "empty_book") {
+              errMsg = `[STOP-LOSS] Order book empty (bid=0) - market may have resolved or no liquidity`;
+            } else {
+              errMsg = `[STOP-LOSS] Bid price too low: $${bidCheck.bid.toFixed(4)} (min: 0.05) - likely bad data or resolved market`;
+            }
+            this.lastMarketSellError = errMsg;
+            console.error(errMsg);
+            // Don't retry if market is likely resolved - throw to trigger redemption flow
+            throw new Error(errMsg);
+          }
+
+          validBid = bidCheck.bid;
+        }
         if (validBid > 0.99) {
           // Cap at 0.99 (max allowed)
           console.log(`[STOP-LOSS] Capping bid from $${validBid.toFixed(2)} to $0.99`);
@@ -462,6 +486,7 @@ export class Trader {
         }
 
         const errMsg = `[STOP-LOSS] Sell failed: ${response.errorMsg || "unknown error"}`;
+        this.lastMarketSellError = errMsg;
         console.error(errMsg);
         throw new Error(errMsg);
       } catch (err: any) {
@@ -471,12 +496,15 @@ export class Trader {
           await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
         }
+        const errMsg = err instanceof Error ? err.message : String(err);
+        this.lastMarketSellError = errMsg;
         console.error("[STOP-LOSS] Sell error:", err);
         return null;
       }
     }
 
     const errMsg = "[STOP-LOSS] Market sell failed after all retries - CRITICAL";
+    this.lastMarketSellError = errMsg;
     console.error(errMsg);
     throw new Error(errMsg);
   }
